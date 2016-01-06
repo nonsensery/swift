@@ -165,20 +165,17 @@ static void emitPolymorphicParametersFromArray(IRGenFunction &IGF,
     llvm::Value *metadata = claimNext(IGF.IGM.TypeMetadataPtrTy);
     metadata->setName(archetype->getFullName());
     IGF.setUnscopedLocalTypeData(CanType(archetype),
-                                 LocalTypeData::forMetatype(),
+                                 LocalTypeDataKind::forMetatype(),
                                  metadata);
   }
 
   // Bind all the argument witness tables.
   for (auto archetype : generics.getAllArchetypes()) {
-    unsigned nextProtocolIndex = 0;
     for (auto protocol : archetype->getConformsTo()) {
-      LocalTypeData key
-        = LocalTypeData::forArchetypeProtocolWitness(nextProtocolIndex);
-      nextProtocolIndex++;
       if (!Lowering::TypeConverter::protocolRequiresWitnessTable(protocol))
         continue;
       llvm::Value *wtable = claimNext(IGF.IGM.WitnessTablePtrTy);
+      auto key = LocalTypeDataKind::forArchetypeProtocolWitnessTable(protocol);
       IGF.setUnscopedLocalTypeData(CanType(archetype), key, wtable);
     }
   }
@@ -289,7 +286,7 @@ static llvm::Value *emitNominalMetadataRef(IRGenFunction &IGF,
   // reference already.
   if (isPattern) {
     if (auto cache = IGF.tryGetLocalTypeData(theType,
-                                             LocalTypeData::forMetatype()))
+                                             LocalTypeDataKind::forMetatype()))
       return cache;
   }
 
@@ -325,7 +322,8 @@ static llvm::Value *emitNominalMetadataRef(IRGenFunction &IGF,
     result->setDoesNotThrow();
     result->addAttribute(llvm::AttributeSet::FunctionIndex,
                          llvm::Attribute::ReadNone);
-    IGF.setScopedLocalTypeData(theType, LocalTypeData::forMetatype(), result);
+    IGF.setScopedLocalTypeData(theType, LocalTypeDataKind::forMetatype(),
+                               result);
     return result;
   }
 
@@ -356,7 +354,8 @@ static llvm::Value *emitNominalMetadataRef(IRGenFunction &IGF,
     result->setDoesNotThrow();
     result->addAttribute(llvm::AttributeSet::FunctionIndex,
                          llvm::Attribute::ReadNone);
-    IGF.setScopedLocalTypeData(theType, LocalTypeData::forMetatype(), result);
+    IGF.setScopedLocalTypeData(theType, LocalTypeDataKind::forMetatype(),
+                               result);
     return result;
   }
 
@@ -388,7 +387,7 @@ static llvm::Value *emitNominalMetadataRef(IRGenFunction &IGF,
   IGF.Builder.CreateLifetimeEnd(argsBuffer,
                           IGF.IGM.getPointerSize() * genericArgs.Values.size());
 
-  IGF.setScopedLocalTypeData(theType, LocalTypeData::forMetatype(), result);
+  IGF.setScopedLocalTypeData(theType, LocalTypeDataKind::forMetatype(), result);
   return result;
 }
 
@@ -963,7 +962,7 @@ namespace {
     }
 
     llvm::Value *visitArchetypeType(CanArchetypeType type) {
-      return IGF.getLocalTypeData(type, LocalTypeData::forMetatype());
+      return IGF.getLocalTypeData(type, LocalTypeDataKind::forMetatype());
     }
 
     llvm::Value *visitGenericTypeParamType(CanGenericTypeParamType type) {
@@ -992,12 +991,12 @@ namespace {
 
     /// Try to find the metatype in local data.
     llvm::Value *tryGetLocal(CanType type) {
-      return IGF.tryGetLocalTypeData(type, LocalTypeData::forMetatype());
+      return IGF.tryGetLocalTypeData(type, LocalTypeDataKind::forMetatype());
     }
 
     /// Set the metatype in local data.
     llvm::Value *setLocal(CanType type, llvm::Instruction *metatype) {
-      IGF.setScopedLocalTypeData(type,  LocalTypeData::forMetatype(),
+      IGF.setScopedLocalTypeData(type,  LocalTypeDataKind::forMetatype(),
                                  metatype);
       return metatype;
     }
@@ -1156,7 +1155,8 @@ static llvm::Value *emitCallToTypeMetadataAccessFunction(IRGenFunction &IGF,
                                                          CanType type,
                                                  ForDefinition_t shouldDefine) {
   // If we already cached the metadata, use it.
-  if (auto local = IGF.tryGetLocalTypeData(type, LocalTypeData::forMetatype()))
+  if (auto local =
+        IGF.tryGetLocalTypeData(type, LocalTypeDataKind::forMetatype()))
     return local;
   
   llvm::Constant *accessor =
@@ -1167,7 +1167,7 @@ static llvm::Value *emitCallToTypeMetadataAccessFunction(IRGenFunction &IGF,
   call->setDoesNotThrow();
   
   // Save the metadata for future lookups.
-  IGF.setScopedLocalTypeData(type, LocalTypeData::forMetatype(), call);
+  IGF.setScopedLocalTypeData(type, LocalTypeDataKind::forMetatype(), call);
   
   return call;
 }
@@ -1394,13 +1394,13 @@ namespace {
     llvm::Value *tryGetLocal(CanType type) {
       return IGF.tryGetLocalTypeDataForLayout(
                                           SILType::getPrimitiveObjectType(type),
-                                          LocalTypeData::forMetatype());
+                                          LocalTypeDataKind::forMetatype());
     }
 
     /// Set the metatype in local data.
     llvm::Value *setLocal(CanType type, llvm::Instruction *metatype) {
       IGF.setScopedLocalTypeDataForLayout(SILType::getPrimitiveObjectType(type),
-                                          LocalTypeData::forMetatype(),
+                                          LocalTypeDataKind::forMetatype(),
                                           metatype);
       return metatype;
     }
@@ -2720,7 +2720,7 @@ namespace {
           value = emitWitnessTableRef(IGF, fillOp.Archetype, fillOp.Protocol);
         } else {
           value = IGF.getLocalTypeData(fillOp.Archetype,
-                                       LocalTypeData::forMetatype());
+                                       LocalTypeDataKind::forMetatype());
         }
         value = IGF.Builder.CreateBitCast(value, IGM.Int8PtrTy);
         auto dest = createPointerSizedGEP(IGF, metadataWords,
@@ -3643,13 +3643,10 @@ void IRGenFunction::setDereferenceableLoad(llvm::LoadInst *load,
 }
 
 /// Emit a load from the given metadata at a constant index.
-///
-/// The load is marked invariant. This function should not be called
-/// on metadata objects that are in the process of being initialized.
-static llvm::LoadInst *emitInvariantLoadFromMetadataAtIndex(IRGenFunction &IGF,
-                                                         llvm::Value *metadata,
-                                                         int index,
-                                                llvm::PointerType *objectTy,
+static llvm::LoadInst *emitLoadFromMetadataAtIndex(IRGenFunction &IGF,
+                                                   llvm::Value *metadata,
+                                                   int index,
+                                                   llvm::Type *objectTy,
                                                 const llvm::Twine &suffix = ""){
   // Require the metadata to be some type that we recognize as a
   // metadata pointer.
@@ -3658,6 +3655,8 @@ static llvm::LoadInst *emitInvariantLoadFromMetadataAtIndex(IRGenFunction &IGF,
   // We require objectType to be a pointer type so that the GEP will
   // scale by the right amount.  We could load an arbitrary type using
   // some extra bitcasting.
+  assert(IGF.IGM.DataLayout.getTypeStoreSize(objectTy) ==
+         IGF.IGM.DataLayout.getTypeStoreSize(IGF.IGM.SizeTy));
 
   // Cast to T*.
   auto objectPtrTy = objectTy->getPointerTo();
@@ -3670,8 +3669,21 @@ static llvm::LoadInst *emitInvariantLoadFromMetadataAtIndex(IRGenFunction &IGF,
                IGF.IGM.getPointerAlignment());
 
   // Load.
-  auto result = IGF.Builder.CreateLoad(slot,
-                                       metadata->getName() + suffix);
+  return IGF.Builder.CreateLoad(slot, metadata->getName() + suffix);
+}
+
+/// Emit a load from the given metadata at a constant index.
+///
+/// The load is marked invariant. This function should not be called
+/// on metadata objects that are in the process of being initialized.
+static llvm::LoadInst *emitInvariantLoadFromMetadataAtIndex(IRGenFunction &IGF,
+                                                         llvm::Value *metadata,
+                                                         int index,
+                                                         llvm::Type *objectTy,
+                                                const llvm::Twine &suffix = ""){
+
+  auto result = emitLoadFromMetadataAtIndex(IGF, metadata, index, objectTy,
+                                            suffix);
   IGF.setInvariantLoad(result);
   return result;
 }
@@ -3681,13 +3693,14 @@ llvm::Value *
 IRGenFunction::emitValueWitnessTableRef(CanType type) {
   // See if we have a cached projection we can use.
   if (auto cached = tryGetLocalTypeData(type,
-                                      LocalTypeData::forValueWitnessTable())) {
+                                  LocalTypeDataKind::forValueWitnessTable())) {
     return cached;
   }
   
   auto metadata = emitTypeMetadataRef(type);
   auto vwtable = emitValueWitnessTableRefForMetadata(metadata);
-  setScopedLocalTypeData(type, LocalTypeData::forValueWitnessTable(), vwtable);
+  setScopedLocalTypeData(type, LocalTypeDataKind::forValueWitnessTable(),
+                         vwtable);
   return vwtable;
 }
 
@@ -3695,8 +3708,8 @@ IRGenFunction::emitValueWitnessTableRef(CanType type) {
 llvm::Value *
 IRGenFunction::emitValueWitnessTableRefForMetadata(llvm::Value *metadata) {
   auto witness = emitInvariantLoadFromMetadataAtIndex(*this, metadata, -1,
-                                     IGM.WitnessTablePtrTy,
-                                     ".valueWitnesses");
+                                                      IGM.WitnessTablePtrTy,
+                                                      ".valueWitnesses");
   // A value witness table is dereferenceable to the number of value witness
   // pointers.
   
@@ -3715,14 +3728,14 @@ llvm::Value *
 IRGenFunction::emitValueWitnessTableRefForLayout(SILType type) {
   // See if we have a cached projection we can use.
   if (auto cached = tryGetLocalTypeDataForLayout(type,
-                                      LocalTypeData::forValueWitnessTable())) {
+                                  LocalTypeDataKind::forValueWitnessTable())) {
     return cached;
   }
   
   auto metadata = emitTypeMetadataRefForLayout(type);
   auto vwtable = emitValueWitnessTableRefForMetadata(metadata);
   setScopedLocalTypeDataForLayout(type,
-                                  LocalTypeData::forValueWitnessTable(),
+                                  LocalTypeDataKind::forValueWitnessTable(),
                                   vwtable);
   return vwtable;
 }
@@ -3732,7 +3745,7 @@ static llvm::Value *emitLoadOfMetadataRefAtIndex(IRGenFunction &IGF,
                                                  llvm::Value *metadata,
                                                  int index) {
   return emitInvariantLoadFromMetadataAtIndex(IGF, metadata, index,
-                                     IGF.IGM.TypeMetadataPtrTy);
+                                              IGF.IGM.TypeMetadataPtrTy);
 }
 
 /// Load the protocol witness table reference at the given index.
@@ -3740,7 +3753,7 @@ static llvm::Value *emitLoadOfWitnessTableRefAtIndex(IRGenFunction &IGF,
                                                      llvm::Value *metadata,
                                                      int index) {
   return emitInvariantLoadFromMetadataAtIndex(IGF, metadata, index,
-                                     IGF.IGM.WitnessTablePtrTy);
+                                              IGF.IGM.WitnessTablePtrTy);
 }
 
 namespace {
@@ -3934,8 +3947,8 @@ llvm::Value *irgen::emitClassFieldOffset(IRGenFunction &IGF,
                                          llvm::Value *metadata) {
   irgen::Size offset = getClassFieldOffset(IGF.IGM, theClass, field);
   int index = getOffsetInWords(IGF.IGM, offset);
-  llvm::Value *val = emitLoadOfWitnessTableRefAtIndex(IGF, metadata, index);
-  return IGF.Builder.CreatePtrToInt(val, IGF.IGM.SizeTy);
+  return emitInvariantLoadFromMetadataAtIndex(IGF, metadata, index,
+                                              IGF.IGM.SizeTy);
 }
 
 /// Given a reference to class metadata of the given type,
@@ -4199,7 +4212,8 @@ llvm::Value *irgen::emitClassHeapMetadataRefForMetatype(IRGenFunction &IGF,
   // a select here instead, which might be profitable.
   IGF.Builder.emitBlock(wrapBB);
   auto classFromWrapper = 
-    emitInvariantLoadFromMetadataAtIndex(IGF, metatype, 1, IGF.IGM.TypeMetadataPtrTy);
+    emitInvariantLoadFromMetadataAtIndex(IGF, metatype, 1,
+                                         IGF.IGM.TypeMetadataPtrTy);
   IGF.Builder.CreateBr(contBB);
 
   // Continuation block.
