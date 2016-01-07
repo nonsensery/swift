@@ -59,6 +59,12 @@ using namespace irgen;
 
 static llvm::Value *emitLoadOfObjCHeapMetadataRef(IRGenFunction &IGF,
                                                   llvm::Value *object);
+static llvm::LoadInst *
+emitLoadFromMetadataAtIndex(IRGenFunction &IGF,
+                            llvm::Value *metadata,
+                            int index,
+                            llvm::Type *objectTy,
+                            const llvm::Twine &suffix = "");
 
 /// Produce a constant to place in a metatype's isa field
 /// corresponding to the given metadata kind.
@@ -1502,7 +1508,7 @@ namespace {
       // If the type is a singleton aggregate, the field's layout is equivalent
       // to the aggregate's.
       if (SILType singletonFieldTy = getSingletonAggregateFieldType(IGF.IGM,
-                                             silTy, ResilienceScope::Component))
+                                             silTy, ResilienceExpansion::Maximal))
         return visit(singletonFieldTy.getSwiftRValueType());
 
       // If the type is fixed-layout, emit a copy of its layout.
@@ -3392,6 +3398,34 @@ namespace {
       }
     }
 
+    // The Objective-C runtime will copy field offsets from the field offset
+    // vector into field offset globals for us, if present. If there's no
+    // Objective-C runtime, we have to do this ourselves.
+    void emitInitializeFieldOffsets(IRGenFunction &IGF,
+                                    llvm::Value *metadata) {
+      unsigned index = FieldLayout.InheritedStoredProperties.size();
+
+      for (auto prop : Target->getStoredProperties()) {
+        auto access = FieldLayout.AllFieldAccesses[index];
+        if (access == FieldAccess::NonConstantDirect) {
+          Address offsetA = IGF.IGM.getAddrOfFieldOffset(prop,
+                                                         /*indirect*/ false,
+                                                         ForDefinition);
+
+          // We can't use emitClassFieldOffset() here because that creates
+          // an invariant load, which could be hoisted above the point
+          // where the metadata becomes fully initialized
+          Size offset = getClassFieldOffset(IGF.IGM, Target, prop);
+          int index = getOffsetInWords(IGF.IGM, offset);
+          auto offsetVal = emitLoadFromMetadataAtIndex(IGF, metadata, index,
+                                                       IGF.IGM.SizeTy);
+          IGF.Builder.CreateStore(offsetVal, offsetA);
+        }
+
+        index++;
+      }
+    }
+
     void emitInitializeMetadata(IRGenFunction &IGF,
                                 llvm::Value *metadata,
                                 llvm::Value *vwtable) {
@@ -3555,8 +3589,10 @@ namespace {
                                 llvm::ConstantInt::get(IGF.IGM.Int1Ty,
                                                        copyFieldOffsetVectors)});
       }
+
+      if (!IGF.IGM.ObjCInterop)
+        emitInitializeFieldOffsets(IGF, metadata);
     }
-    
   };
 }
 
@@ -3647,7 +3683,7 @@ static llvm::LoadInst *emitLoadFromMetadataAtIndex(IRGenFunction &IGF,
                                                    llvm::Value *metadata,
                                                    int index,
                                                    llvm::Type *objectTy,
-                                                const llvm::Twine &suffix = ""){
+                                                   const llvm::Twine &suffix) {
   // Require the metadata to be some type that we recognize as a
   // metadata pointer.
   assert(metadata->getType() == IGF.IGM.TypeMetadataPtrTy);
@@ -3676,12 +3712,12 @@ static llvm::LoadInst *emitLoadFromMetadataAtIndex(IRGenFunction &IGF,
 ///
 /// The load is marked invariant. This function should not be called
 /// on metadata objects that are in the process of being initialized.
-static llvm::LoadInst *emitInvariantLoadFromMetadataAtIndex(IRGenFunction &IGF,
-                                                         llvm::Value *metadata,
-                                                         int index,
-                                                         llvm::Type *objectTy,
-                                                const llvm::Twine &suffix = ""){
-
+static llvm::LoadInst *
+emitInvariantLoadFromMetadataAtIndex(IRGenFunction &IGF,
+                                     llvm::Value *metadata,
+                                     int index,
+                                     llvm::Type *objectTy,
+                                     const llvm::Twine &suffix = "") {
   auto result = emitLoadFromMetadataAtIndex(IGF, metadata, index, objectTy,
                                             suffix);
   IGF.setInvariantLoad(result);
@@ -4271,7 +4307,7 @@ llvm::Value *irgen::emitVirtualMethodValue(IRGenFunction &IGF,
       instanceTy = SILType::getPrimitiveObjectType(metaTy.getInstanceType());
 
     if (IGF.IGM.isResilient(instanceTy.getClassOrBoundGenericClass(),
-                            ResilienceScope::Component)) {
+                            ResilienceExpansion::Maximal)) {
       // The derived type that is making the super call is resilient,
       // for example we may be in an extension of a class outside of our
       // resilience domain. So, we need to load the superclass metadata
@@ -4535,9 +4571,9 @@ public:
     auto enumTy = Target->getDeclaredTypeInContext()->getCanonicalType();
     auto &enumTI = IGM.getTypeInfoForLowered(enumTy);
     (void) enumTI;
-    assert(enumTI.isFixedSize(ResilienceScope::Component) &&
+    assert(enumTI.isFixedSize(ResilienceExpansion::Maximal) &&
            "emitting constant enum metadata for resilient-sized type?");
-    assert(!enumTI.isFixedSize(ResilienceScope::Universal) &&
+    assert(!enumTI.isFixedSize(ResilienceExpansion::Minimal) &&
            "non-generic, non-resilient enums don't need payload size in metadata");
 
     auto &strategy = getEnumImplStrategy(IGM, enumTy);
@@ -4580,7 +4616,7 @@ public:
     auto enumTy = Target->getDeclaredTypeInContext()->getCanonicalType();
     auto &enumTI = IGM.getTypeInfoForLowered(enumTy);
     (void) enumTI;
-    assert(!enumTI.isFixedSize(ResilienceScope::Universal) &&
+    assert(!enumTI.isFixedSize(ResilienceExpansion::Minimal) &&
            "non-generic, non-resilient enums don't need payload size in metadata");
     addConstantWord(0);
   }
